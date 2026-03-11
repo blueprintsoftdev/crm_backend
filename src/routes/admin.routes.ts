@@ -9,6 +9,7 @@ import {
 } from "../controllers/updateProfile.controller";
 import {
   getAdminSummary,
+  getDashboardData,
   getAllUsers,
   createAdminUser,
   updateUser,
@@ -51,6 +52,9 @@ router.post(
 
 // Dashboard summary — gated by REPORTS_ANALYTICS feature flag
 router.get("/summary", authMiddleware, adminMiddleware, featureGate("REPORTS_ANALYTICS"), getAdminSummary);
+
+// Dashboard live snapshot — no feature gate (always accessible to admin/super-admin)
+router.get("/dashboard", authMiddleware, adminMiddleware, getDashboardData);
 
 // Company settings — GET is public (invoice pages), PUT requires admin
 router.get("/company-settings", getCompanySettings);

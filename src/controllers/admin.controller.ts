@@ -132,6 +132,202 @@ export const getAdminSummary = async (_req: Request, res: Response) => {
   }
 };
 
+// GET /api/admin/dashboard  (admin) — full live snapshot for dashboard home
+export const getDashboardData = async (_req: Request, res: Response) => {
+  try {
+    const now = new Date();
+    const sevenDaysAgo = daysAgo(7);
+    const thirtyDaysAgo = daysAgo(30);
+    const sixtyDaysAgo = daysAgo(60);
+
+    const [
+      // Summary stats
+      totalRevenueAgg,
+      thisMonthRevenueAgg,
+      prevMonthRevenueAgg,
+      totalOrders,
+      thisMonthOrders,
+      prevMonthOrders,
+      pendingOrders,
+      totalCustomers,
+      thisMonthCustomers,
+      prevMonthCustomers,
+      totalProducts,
+      // Sales chart last 7 days
+      last7PaidOrders,
+      // Order status counts
+      processingCount,
+      confirmedCount,
+      shippedCount,
+      deliveredCount,
+      cancelledCount,
+      // Low stock products
+      lowStockProducts,
+      // Recent orders
+      recentOrders,
+      // Payment methods
+      onlineAgg,
+      codAgg,
+      // Order items for top categories
+      categoryOrderItems,
+      // Top products
+      topProductItems,
+    ] = await Promise.all([
+      prisma.order.aggregate({ where: { paymentStatus: "PAID" }, _sum: { finalAmount: true } }),
+      prisma.order.aggregate({ where: { paymentStatus: "PAID", createdAt: { gte: thirtyDaysAgo } }, _sum: { finalAmount: true } }),
+      prisma.order.aggregate({ where: { paymentStatus: "PAID", createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } }, _sum: { finalAmount: true } }),
+      prisma.order.count(),
+      prisma.order.count({ where: { createdAt: { gte: thirtyDaysAgo } } }),
+      prisma.order.count({ where: { createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } } }),
+      prisma.order.count({ where: { orderStatus: "PROCESSING" } }),
+      prisma.user.count({ where: { role: "CUSTOMER" } }),
+      prisma.user.count({ where: { role: "CUSTOMER", createdAt: { gte: thirtyDaysAgo } } }),
+      prisma.user.count({ where: { role: "CUSTOMER", createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } } }),
+      prisma.product.count(),
+      // Last 7 days paid orders for revenue chart
+      prisma.order.findMany({
+        where: { paymentStatus: "PAID", createdAt: { gte: sevenDaysAgo } },
+        select: { finalAmount: true, createdAt: true },
+      }),
+      // Order status breakdown
+      prisma.order.count({ where: { orderStatus: "PROCESSING" } }),
+      prisma.order.count({ where: { orderStatus: "CONFIRMED" } }),
+      prisma.order.count({ where: { orderStatus: "SHIPPED" } }),
+      prisma.order.count({ where: { orderStatus: "DELIVERED" } }),
+      prisma.order.count({ where: { orderStatus: "CANCELLED" } }),
+      // Low stock: products with stock <= 10, ordered by stock asc
+      prisma.product.findMany({
+        where: { stock: { lte: 10 } },
+        select: { id: true, name: true, stock: true, image: true, category: { select: { name: true } } },
+        orderBy: { stock: "asc" },
+        take: 8,
+      }),
+      // Recent orders
+      prisma.order.findMany({
+        select: {
+          id: true,
+          finalAmount: true,
+          orderStatus: true,
+          paymentStatus: true,
+          paymentMethod: true,
+          createdAt: true,
+          user: { select: { username: true, email: true } },
+        },
+        orderBy: { createdAt: "desc" },
+        take: 8,
+      }),
+      // Payment methods
+      prisma.order.aggregate({ where: { paymentMethod: "ONLINE" }, _sum: { finalAmount: true }, _count: { id: true } }),
+      prisma.order.aggregate({ where: { paymentMethod: "POD" }, _sum: { finalAmount: true }, _count: { id: true } }),
+      // Category revenue
+      prisma.orderItem.findMany({
+        select: {
+          quantity: true,
+          price: true,
+          product: { select: { category: { select: { id: true, name: true } } } },
+        },
+        take: 5000,
+      }),
+      // Top products by revenue
+      prisma.orderItem.groupBy({
+        by: ["productId"],
+        _sum: { price: true, quantity: true },
+        orderBy: { _sum: { price: "desc" } },
+        take: 5,
+      }),
+    ]);
+
+    // ── Build sales chart (last 7 days) ────────────────────────────────────
+    const salesByDate: Record<string, { date: string; revenue: number; orders: number }> = {};
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(now.getDate() - i);
+      const key = d.toISOString().split("T")[0];
+      salesByDate[key] = { date: key, revenue: 0, orders: 0 };
+    }
+    for (const o of last7PaidOrders) {
+      const key = o.createdAt.toISOString().split("T")[0];
+      if (salesByDate[key]) {
+        salesByDate[key].revenue += o.finalAmount;
+        salesByDate[key].orders += 1;
+      }
+    }
+
+    // ── Build category breakdown ───────────────────────────────────────────
+    const catMap: Record<string, { name: string; revenue: number; unitsSold: number }> = {};
+    for (const item of categoryOrderItems) {
+      const cat = item.product?.category;
+      if (!cat) continue;
+      if (!catMap[cat.id]) catMap[cat.id] = { name: cat.name, revenue: 0, unitsSold: 0 };
+      catMap[cat.id].revenue += item.price;
+      catMap[cat.id].unitsSold += item.quantity;
+    }
+    const topCategories = Object.entries(catMap)
+      .map(([id, v]) => ({ id, ...v }))
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 6);
+
+    // ── Resolve top product names ──────────────────────────────────────────
+    const productIds = topProductItems.map((i) => i.productId);
+    const products = await prisma.product.findMany({
+      where: { id: { in: productIds } },
+      select: { id: true, name: true, price: true, image: true },
+    });
+    const productMap = Object.fromEntries(products.map((p) => [p.id, p]));
+    const topProducts = topProductItems.map((item) => ({
+      product: productMap[item.productId] ?? null,
+      totalRevenue: item._sum.price ?? 0,
+      totalQuantitySold: item._sum.quantity ?? 0,
+    }));
+
+    const pct = (curr: number, prev: number) => {
+      if (prev === 0) return curr === 0 ? 0 : 100;
+      return Math.round(((curr - prev) / prev) * 100);
+    };
+
+    res.json({
+      summary: {
+        revenue: {
+          total: totalRevenueAgg._sum.finalAmount ?? 0,
+          thisMonth: thisMonthRevenueAgg._sum.finalAmount ?? 0,
+          growthPct: pct(thisMonthRevenueAgg._sum.finalAmount ?? 0, prevMonthRevenueAgg._sum.finalAmount ?? 0),
+        },
+        orders: {
+          total: totalOrders,
+          thisMonth: thisMonthOrders,
+          pending: pendingOrders,
+          growthPct: pct(thisMonthOrders, prevMonthOrders),
+        },
+        customers: {
+          total: totalCustomers,
+          thisMonth: thisMonthCustomers,
+          growthPct: pct(thisMonthCustomers, prevMonthCustomers),
+        },
+        products: { total: totalProducts },
+      },
+      salesChart: Object.values(salesByDate),
+      orderStatus: [
+        { status: "PROCESSING", count: processingCount },
+        { status: "CONFIRMED", count: confirmedCount },
+        { status: "SHIPPED", count: shippedCount },
+        { status: "DELIVERED", count: deliveredCount },
+        { status: "CANCELLED", count: cancelledCount },
+      ].filter((s) => s.count > 0),
+      topCategories,
+      topProducts,
+      lowStockProducts,
+      recentOrders,
+      paymentMethods: [
+        { method: "ONLINE", count: onlineAgg._count.id, revenue: onlineAgg._sum.finalAmount ?? 0 },
+        { method: "COD", count: codAgg._count.id, revenue: codAgg._sum.finalAmount ?? 0 },
+      ],
+    });
+  } catch (err: any) {
+    logger.error("getDashboardData error", err);
+    res.status(500).json({ message: "Error loading dashboard snapshot" });
+  }
+};
+
 // GET /api/admin/users?page=1&limit=20  (admin)
 export const getAllUsers = async (req: Request, res: Response) => {
   try {
